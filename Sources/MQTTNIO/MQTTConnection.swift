@@ -41,13 +41,28 @@ final class MQTTConnection {
         self.taskHandler = taskHandler
     }
 
-    static func create(client: MQTTClient, cleanSession: Bool, pingInterval: TimeAmount) -> EventLoopFuture<MQTTConnection> {
+    static func create(
+        client: MQTTClient,
+        cleanSession: Bool,
+        pingInterval: TimeAmount,
+        manualQoS1AcknowledgementSettings: MQTTManualQoS1AcknowledgementSettings?
+    ) -> EventLoopFuture<MQTTConnection> {
         let taskHandler = MQTTTaskHandler(client: client)
-        return self.createBootstrap(client: client, pingInterval: pingInterval, taskHandler: taskHandler)
-            .map { MQTTConnection(channel: $0, cleanSession: cleanSession, timeout: client.configuration.timeout, taskHandler: taskHandler) }
+        return self.createBootstrap(
+            client: client,
+            pingInterval: pingInterval,
+            taskHandler: taskHandler,
+            manualQoS1AcknowledgementSettings: manualQoS1AcknowledgementSettings
+        )
+        .map { MQTTConnection(channel: $0, cleanSession: cleanSession, timeout: client.configuration.timeout, taskHandler: taskHandler) }
     }
 
-    static func createBootstrap(client: MQTTClient, pingInterval: TimeAmount, taskHandler: MQTTTaskHandler) -> EventLoopFuture<Channel> {
+    static func createBootstrap(
+        client: MQTTClient,
+        pingInterval: TimeAmount,
+        taskHandler: MQTTTaskHandler,
+        manualQoS1AcknowledgementSettings: MQTTManualQoS1AcknowledgementSettings?
+    ) -> EventLoopFuture<Channel> {
         let eventLoop = client.eventLoopGroup.next()
         let channelPromise = eventLoop.makePromise(of: Channel.self)
         do {
@@ -59,7 +74,11 @@ final class MQTTConnection {
                 .channelInitializer { channel in
                     // Work out what handlers to add
                     let handlers: [ChannelHandler] = [
-                        MQTTMessageHandler(client, pingInterval: pingInterval),
+                        MQTTMessageHandler(
+                            client,
+                            pingInterval: pingInterval,
+                            manualQoS1AcknowledgementSettings: manualQoS1AcknowledgementSettings
+                        ),
                         taskHandler,
                     ]
                     // are we using websockets
@@ -199,6 +218,18 @@ final class MQTTConnection {
 
     func sendMessageNoWait(_ message: MQTTPacket) -> EventLoopFuture<Void> {
         self.channel.writeAndFlush(message)
+    }
+
+    func prepareForClose() -> EventLoopFuture<Void> {
+        self.channel.pipeline.context(handlerType: MQTTMessageHandler.self)
+            .map { context in
+                (context.handler as? MQTTMessageHandler)?.prepareForClose(context: context)
+            }
+            .flatMapError { _ in
+                // A removed pipeline has already invoked handlerRemoved and fenced the
+                // manual coordinator. Closing the transport remains the next step.
+                self.channel.eventLoop.makeSucceededVoidFuture()
+            }
     }
 
     func close() -> EventLoopFuture<Void> {

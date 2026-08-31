@@ -82,7 +82,8 @@ public final class MQTTClient {
     private var inflight: MQTTInflight
     /// flag to tell is client is shutdown
     private let isShutdown = ManagedAtomic(false)
-    private var _manualQoS1AcknowledgementHandler: MQTTManualQoS1AcknowledgementHandler?
+    private var _manualQoS1AcknowledgementSettings: MQTTManualQoS1AcknowledgementSettings?
+    private var _connectionAttemptCount = 0
 
     typealias ShutdownCallback = @Sendable (Error?) -> Void
 
@@ -120,7 +121,7 @@ public final class MQTTClient {
         self.identifier = identifier
         self.configuration = configuration
         self._connection = nil
-        self._manualQoS1AcknowledgementHandler = nil
+        self._manualQoS1AcknowledgementSettings = nil
         self.logger = (logger ?? Self.loggingDisabled).attachingClientIdentifier(self.identifier)
         self.eventLoopGroupProvider = eventLoopGroupProvider
         switch eventLoopGroupProvider {
@@ -219,42 +220,66 @@ public final class MQTTClient {
     ///   - queue: Dispatch Queue to run shutdown on
     ///   - callback: Callback called when shutdown is complete. If there was an error it will return with Error in callback
     public func shutdown(queue: DispatchQueue = .global(), _ callback: @escaping (Error?) -> Void) {
-        guard self.isShutdown.compareExchange(expected: false, desired: true, ordering: .relaxed).exchanged else {
+        let shutdownStarted = self.lock.withLock {
+            self.isShutdown.compareExchange(expected: false, desired: true, ordering: .relaxed).exchanged
+        }
+        guard shutdownStarted else {
             callback(MQTTError.alreadyShutdown)
             return
         }
-        let eventLoop = self.eventLoopGroup.next()
+        let connection = self.connection
+        let eventLoop = connection?.channel.eventLoop ?? self.eventLoopGroup.next()
         let closeFuture: EventLoopFuture<Void>
-        if let connection = self.connection {
-            closeFuture = connection.close()
+        if let connection {
+            closeFuture = connection.prepareForClose().flatMap {
+                connection.close()
+            }
         } else {
             closeFuture = eventLoop.makeSucceededVoidFuture()
         }
         closeFuture.whenComplete { result in
-            let closeError: Error?
-            switch result {
-            case .failure(let error):
-                if case ChannelError.alreadyClosed = error {
+            let finish: @Sendable (Error?) -> Void = { barrierError in
+                let closeError: Error?
+                switch result {
+                case .failure(let error):
+                    if case ChannelError.alreadyClosed = error {
+                        closeError = nil
+                    } else {
+                        closeError = error
+                    }
+                    self.shutdownListeners.notify(.failure(error))
+                case .success:
                     closeError = nil
-                } else {
-                    closeError = error
+                    self.shutdownListeners.notify(.success(()))
                 }
-                self.shutdownListeners.notify(.failure(error))
-            case .success:
-                closeError = nil
-                self.shutdownListeners.notify(.success(()))
-            }
-            // remove all listeners as they may contain references to the client and cause
-            // a reference cycle
-            self.publishListeners.removeAll()
-            self.closeListeners.removeAll()
-            self.shutdownListeners.removeAll()
-            self.lock.withLock {
-                self._manualQoS1AcknowledgementHandler = nil
+                // remove all listeners as they may contain references to the client and cause
+                // a reference cycle
+                self.publishListeners.removeAll()
+                self.closeListeners.removeAll()
+                self.shutdownListeners.removeAll()
+                self.lock.withLock {
+                    self._manualQoS1AcknowledgementSettings = nil
+                }
+
+                self.shutdownEventLoopGroup(queue: queue) { error in
+                    callback(closeError ?? barrierError ?? error)
+                }
             }
 
-            self.shutdownEventLoopGroup(queue: queue) { error in
-                callback(closeError ?? error)
+            // A channel-owned manual acknowledgement gate closes during channelInactive.
+            // Before stopping an owned group, execute one final barrier so every callback
+            // that won the gate race before close has observed the terminal channel state.
+            if connection != nil, case .createNew = self.eventLoopGroupProvider {
+                eventLoop.submit {}.whenComplete { barrierResult in
+                    switch barrierResult {
+                    case .success:
+                        finish(nil)
+                    case .failure(let error):
+                        finish(error)
+                    }
+                }
+            } else {
+                finish(nil)
             }
         }
     }
@@ -431,15 +456,41 @@ public final class MQTTClient {
     /// and closes the connection so a persistent broker session can redeliver the
     /// message.
     ///
-    /// The future may belong to any event loop. The handler itself runs on the
-    /// connection's event loop, so it must start asynchronous work and return without
-    /// blocking. Calling this method again atomically replaces the previous handler;
-    /// pass `nil` to restore the original ACK-before-listener behavior. Shutdown clears
-    /// the handler. Calls made after shutdown begins have no effect.
-    public func setManualQoS1AcknowledgementHandler(_ handler: MQTTManualQoS1AcknowledgementHandler?) {
+    /// PUBACKs remain ordered by PUBLISH receive order even when returned futures
+    /// complete out of order. The future may belong to any event loop. The handler
+    /// itself runs on the connection's event loop, so it must start asynchronous work
+    /// and return without blocking.
+    ///
+    /// Install or replace the handler before connecting. Its policy is immutable for
+    /// a connection, and only shutdown clears it. A connection using this mode must
+    /// request a persistent broker session and use a stable, non-empty client
+    /// identifier. Use the returned result to fail startup if configuration is unsafe.
+    ///
+    /// - Parameters:
+    ///   - handler: Durable admission handler. `nil` is rejected; shutdown is the only
+    ///     supported way to clear manual acknowledgement mode.
+    ///   - limits: High/low pending-admission watermarks used for socket backpressure.
+    /// - Returns: Success when the policy was installed, otherwise a non-trapping
+    ///   configuration error.
+    @discardableResult
+    public func setManualQoS1AcknowledgementHandler(
+        _ handler: MQTTManualQoS1AcknowledgementHandler?,
+        limits: MQTTManualQoS1AcknowledgementLimits = .init()
+    ) -> Result<Void, MQTTManualQoS1AcknowledgementError> {
         self.lock.withLock {
-            guard !self.isShutdown.load(ordering: .relaxed) else { return }
-            self._manualQoS1AcknowledgementHandler = handler
+            guard !self.isShutdown.load(ordering: .relaxed) else { return .failure(.clientShutdown) }
+            guard let handler else { return .failure(.handlerRemovalRequiresShutdown) }
+            guard limits.maximumPending > 0,
+                limits.resumePendingAt >= 0,
+                limits.resumePendingAt < limits.maximumPending
+            else {
+                return .failure(.invalidPendingLimits)
+            }
+            guard self._connection == nil, self._connectionAttemptCount == 0 else {
+                return .failure(.connectionActive)
+            }
+            self._manualQoS1AcknowledgementSettings = .init(handler: handler, limits: limits)
+            return .success(())
         }
     }
 
@@ -494,9 +545,49 @@ public final class MQTTClient {
     private var _connection: MQTTConnection?
     private var lock = NIOLock()
 
-    var manualQoS1AcknowledgementHandler: MQTTManualQoS1AcknowledgementHandler? {
+    var manualQoS1AcknowledgementSettings: MQTTManualQoS1AcknowledgementSettings? {
         self.lock.withLock {
-            self._manualQoS1AcknowledgementHandler
+            self._manualQoS1AcknowledgementSettings
+        }
+    }
+
+    func manualQoS1AcknowledgementValidationError(
+        persistentSession: Bool
+    ) -> MQTTManualQoS1AcknowledgementError? {
+        self.lock.withLock {
+            guard self._manualQoS1AcknowledgementSettings != nil else { return nil }
+            guard persistentSession else { return .persistentSessionRequired }
+            guard !self.identifier.isEmpty else { return .stableClientIdentifierRequired }
+            return nil
+        }
+    }
+
+    func prepareConnection(
+        persistentSession: Bool
+    ) -> Result<MQTTManualQoS1AcknowledgementSettings?, MQTTManualQoS1AcknowledgementError> {
+        self.lock.withLock {
+            if self._manualQoS1AcknowledgementSettings != nil {
+                guard !self.isShutdown.load(ordering: .relaxed) else { return .failure(.clientShutdown) }
+                guard self._connection == nil, self._connectionAttemptCount == 0 else {
+                    return .failure(.connectionActive)
+                }
+                guard persistentSession else { return .failure(.persistentSessionRequired) }
+                guard !self.identifier.isEmpty else { return .failure(.stableClientIdentifierRequired) }
+            }
+            self._connectionAttemptCount += 1
+            return .success(self._manualQoS1AcknowledgementSettings)
+        }
+    }
+
+    func connectionAttemptDidFailBeforeCreatingChannel() {
+        self.lock.withLock {
+            self._connectionAttemptCount = max(0, self._connectionAttemptCount - 1)
+        }
+    }
+
+    private func connectionDidClose() {
+        self.lock.withLock {
+            self._connectionAttemptCount = max(0, self._connectionAttemptCount - 1)
         }
     }
 }
@@ -509,16 +600,41 @@ extension MQTTClient {
     ) -> EventLoopFuture<MQTTConnAckPacket> {
         let pingInterval = self.configuration.pingInterval ?? TimeAmount.seconds(max(Int64(packet.keepAliveSeconds - 5), 5))
         var cleanSession = packet.cleanSession
+        var hasPositiveSessionExpiry = false
         // if connection has non zero session expiry then assume it doesnt clean session on close
         for p in packet.properties {
             // check topic alias
             if case .sessionExpiryInterval(let interval) = p {
                 if interval > 0 {
                     cleanSession = false
+                    hasPositiveSessionExpiry = true
                 }
             }
         }
-        let connectFuture = MQTTConnection.create(client: self, cleanSession: cleanSession, pingInterval: pingInterval)
+        let persistentSession: Bool
+        switch self.configuration.version {
+        case .v3_1_1:
+            persistentSession = !packet.cleanSession
+        case .v5_0:
+            persistentSession = hasPositiveSessionExpiry
+        }
+        let manualSettings: MQTTManualQoS1AcknowledgementSettings?
+        switch self.prepareConnection(persistentSession: persistentSession) {
+        case .success(let settings):
+            manualSettings = settings
+        case .failure(let error):
+            return self.eventLoopGroup.next().makeFailedFuture(error)
+        }
+
+        let connectFuture = MQTTConnection.create(
+            client: self,
+            cleanSession: cleanSession,
+            pingInterval: pingInterval,
+            manualQoS1AcknowledgementSettings: manualSettings
+        )
+        connectFuture.whenFailure { _ in
+            self.connectionAttemptDidFailBeforeCreatingChannel()
+        }
         let eventLoop = connectFuture.eventLoop
         return
             connectFuture
@@ -530,6 +646,7 @@ extension MQTTClient {
                     if self.connection === connection {
                         self.connection = nil
                     }
+                    self.connectionDidClose()
                     self.logger.debug("Network connection closed")
                     self.closeListeners.notify(result)
                 }
@@ -835,11 +952,14 @@ extension MQTTClient {
     func disconnect(packet: MQTTDisconnectPacket) -> EventLoopFuture<Void> {
         guard let connection = self.connection else { return self.eventLoopGroup.next().makeFailedFuture(MQTTError.noConnection) }
 
-        return connection.sendMessageNoWait(packet)
+        return connection.prepareForClose()
             .flatMap {
-                let future = self.connection?.close()
+                connection.sendMessageNoWait(packet)
+            }
+            .flatMap {
+                let future = connection.close()
                 self.connection = nil
-                return future ?? self.eventLoopGroup.next().makeSucceededFuture(())
+                return future
             }
     }
 }
