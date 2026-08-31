@@ -22,22 +22,39 @@ class MQTTMessageHandler: ChannelDuplexHandler {
 
     let client: MQTTClient
     let pingreqHandler: PingreqHandler?
+    let manualQoS1AcknowledgementCoordinator: MQTTManualQoS1AcknowledgementCoordinator?
     var decoder: NIOSingleStepByteToMessageProcessor<ByteToMQTTMessageDecoder>
 
-    init(_ client: MQTTClient, pingInterval: TimeAmount) {
+    init(
+        _ client: MQTTClient,
+        pingInterval: TimeAmount,
+        manualQoS1AcknowledgementSettings: MQTTManualQoS1AcknowledgementSettings? = nil
+    ) {
         self.client = client
         if client.configuration.disablePing {
             self.pingreqHandler = nil
         } else {
             self.pingreqHandler = .init(client: client, timeout: pingInterval)
         }
+        self.manualQoS1AcknowledgementCoordinator = manualQoS1AcknowledgementSettings.map {
+            .init(client: client, settings: $0)
+        }
         self.decoder = .init(.init(version: client.configuration.version))
     }
 
     func handlerAdded(context: ChannelHandlerContext) {
+        self.manualQoS1AcknowledgementCoordinator?.handlerAdded(context: context)
         if context.channel.isActive {
             self.pingreqHandler?.start(context: context)
         }
+    }
+
+    func handlerRemoved(context: ChannelHandlerContext) {
+        self.manualQoS1AcknowledgementCoordinator?.stop(context: context)
+    }
+
+    func prepareForClose(context: ChannelHandlerContext) {
+        self.manualQoS1AcknowledgementCoordinator?.stop(context: context)
     }
 
     func channelActive(context: ChannelHandlerContext) {
@@ -47,6 +64,7 @@ class MQTTMessageHandler: ChannelDuplexHandler {
 
     func channelInactive(context: ChannelHandlerContext) {
         self.pingreqHandler?.stop()
+        self.manualQoS1AcknowledgementCoordinator?.stop(context: context)
         context.fireChannelInactive()
     }
 
@@ -68,6 +86,9 @@ class MQTTMessageHandler: ChannelDuplexHandler {
 
         do {
             try self.decoder.process(buffer: buffer) { message in
+                if self.manualQoS1AcknowledgementCoordinator?.terminal == true {
+                    return
+                }
                 switch message.type {
                 case .PUBLISH:
                     let publishMessage = message as! MQTTPublishPacket
@@ -80,7 +101,7 @@ class MQTTMessageHandler: ChannelDuplexHandler {
                             "mqtt_topicName": .string(publishMessage.publish.topicName),
                         ]
                     )
-                    self.respondToPublish(publishMessage)
+                    self.respondToPublish(publishMessage, context: context)
                     return
 
                 case .CONNACK, .PUBACK, .PUBREC, .PUBCOMP, .SUBACK, .UNSUBACK, .PINGRESP, .AUTH:
@@ -93,10 +114,12 @@ class MQTTMessageHandler: ChannelDuplexHandler {
                 case .DISCONNECT:
                     let disconnectMessage = message as! MQTTDisconnectPacket
                     let ack = MQTTAckV5(reason: disconnectMessage.reason, properties: disconnectMessage.properties)
+                    self.manualQoS1AcknowledgementCoordinator?.stop(context: context)
                     context.fireErrorCaught(MQTTError.serverDisconnection(ack))
                     context.close(promise: nil)
 
                 case .CONNECT, .SUBSCRIBE, .UNSUBSCRIBE, .PINGREQ:
+                    self.manualQoS1AcknowledgementCoordinator?.stop(context: context)
                     context.fireErrorCaught(MQTTError.unexpectedMessage)
                     context.close(promise: nil)
                     self.client.logger.error("Unexpected MQTT Message", metadata: ["mqtt_message": .string("\(message)")])
@@ -108,6 +131,7 @@ class MQTTMessageHandler: ChannelDuplexHandler {
                 )
             }
         } catch {
+            self.manualQoS1AcknowledgementCoordinator?.stop(context: context)
             context.fireErrorCaught(error)
             context.close(promise: nil)
             self.client.logger.error("Error processing MQTT message", metadata: ["mqtt_error": .string("\(error)")])
@@ -122,16 +146,24 @@ class MQTTMessageHandler: ChannelDuplexHandler {
     /// If QoS is `.atMostOnce` then no response is required
     /// If QoS is `.atLeastOnce` then send PUBACK
     /// If QoS is `.exactlyOnce` then send PUBREC, wait for PUBREL and then respond with PUBCOMP (in `respondToPubrel`)
-    private func respondToPublish(_ message: MQTTPublishPacket) {
+    private func respondToPublish(_ message: MQTTPublishPacket, context: ChannelHandlerContext) {
         guard let connection = client.connection else { return }
         switch message.publish.qos {
         case .atMostOnce:
             self.client.publishListeners.notify(.success(message.publish))
 
         case .atLeastOnce:
-            connection.sendMessageNoWait(MQTTPubAckPacket(type: .PUBACK, packetId: message.packetId))
-                .map { _ in message.publish }
-                .whenComplete { self.client.publishListeners.notify($0) }
+            if let coordinator = self.manualQoS1AcknowledgementCoordinator {
+                coordinator.admit(
+                    packetIdentifier: message.packetId,
+                    publish: message.publish,
+                    context: context
+                )
+            } else {
+                connection.sendMessageNoWait(MQTTPubAckPacket(type: .PUBACK, packetId: message.packetId))
+                    .map { _ in message.publish }
+                    .whenComplete { self.client.publishListeners.notify($0) }
+            }
 
         case .exactlyOnce:
             var publish = message.publish
@@ -163,5 +195,13 @@ class MQTTMessageHandler: ChannelDuplexHandler {
     private func respondToPubrel(_ message: MQTTPacket) {
         guard let connection = client.connection else { return }
         _ = connection.sendMessageNoWait(MQTTPubAckPacket(type: .PUBCOMP, packetId: message.packetId))
+    }
+
+    var manualQoS1PendingCount: Int {
+        self.manualQoS1AcknowledgementCoordinator?.pendingCount ?? 0
+    }
+
+    var manualQoS1ReadIsSuspended: Bool {
+        self.manualQoS1AcknowledgementCoordinator?.readIsSuspended ?? false
     }
 }

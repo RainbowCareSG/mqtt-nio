@@ -38,6 +38,10 @@
 
 - ``publish(to:payload:qos:retain:)``
 - ``publish(to:payload:qos:retain:properties:)``
+- ``setManualQoS1AcknowledgementHandler(_:limits:)``
+- ``MQTTManualQoS1AcknowledgementHandler``
+- ``MQTTManualQoS1AcknowledgementLimits``
+- ``MQTTManualQoS1AcknowledgementError``
 
 ### Subscriptions
 

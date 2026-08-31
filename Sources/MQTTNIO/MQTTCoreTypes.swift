@@ -81,6 +81,60 @@ public struct MQTTPublishInfo: Sendable {
     static let emptyByteBuffer = ByteBufferAllocator().buffer(capacity: 0)
 }
 
+/// Handles an inbound QoS 1 publish whose PUBACK is controlled by the application.
+///
+/// Return a future that succeeds only after `publish` has been durably accepted. The
+/// future may belong to any event loop. MQTTNIO sends PUBACK after it succeeds and in
+/// the same order as the corresponding PUBLISH packets were received. If admission or
+/// PUBACK writing fails, MQTTNIO closes the connection, suppresses all later PUBACKs,
+/// and relies on the required persistent broker session for redelivery.
+///
+/// The handler is called on the connection's event loop and must return promptly. Do
+/// not block while doing durable work; represent that work with the returned future.
+/// Install it before connecting with a stable client identifier and persistent session.
+public typealias MQTTManualQoS1AcknowledgementHandler =
+    @Sendable (
+        _ packetIdentifier: UInt16,
+        _ publish: MQTTPublishInfo
+    ) -> EventLoopFuture<Void>
+
+/// Bounds the number of inbound QoS 1 publishes waiting for durable admission.
+///
+/// MQTTNIO pauses socket auto-read when `maximumPending` publishes are pending and
+/// resumes it after the ordered queue drains to `resumePendingAt` or fewer. A publish
+/// that was already decoded after the maximum was reached fails the connection closed
+/// without PUBACK.
+public struct MQTTManualQoS1AcknowledgementLimits: Equatable, Sendable {
+    /// Maximum number of publishes admitted concurrently. Must be greater than zero.
+    public let maximumPending: Int
+    /// Pending count at or below which socket auto-read resumes. Must be non-negative
+    /// and less than `maximumPending`.
+    public let resumePendingAt: Int
+
+    public init(maximumPending: Int = 128, resumePendingAt: Int = 64) {
+        self.maximumPending = maximumPending
+        self.resumePendingAt = resumePendingAt
+    }
+}
+
+/// Errors configuring or operating completion-controlled inbound QoS 1 acknowledgement.
+public enum MQTTManualQoS1AcknowledgementError: Error, Equatable, Sendable {
+    /// The client has begun shutting down.
+    case clientShutdown
+    /// A connection attempt or live connection already owns the acknowledgement mode.
+    case connectionActive
+    /// Manual acknowledgement can only be cleared by shutting down the client.
+    case handlerRemovalRequiresShutdown
+    /// `maximumPending` and `resumePendingAt` do not form a valid high/low watermark.
+    case invalidPendingLimits
+    /// Close-without-PUBACK is only durable when the broker session persists.
+    case persistentSessionRequired
+    /// Durable broker sessions require a stable, non-empty client identifier.
+    case stableClientIdentifierRequired
+    /// More publishes were decoded than the configured admission window can hold.
+    case pendingAdmissionLimitExceeded(Int)
+}
+
 /// MQTT SUBSCRIBE packet parameters.
 public struct MQTTSubscribeInfo: Sendable {
     /// Topic filter to subscribe to.

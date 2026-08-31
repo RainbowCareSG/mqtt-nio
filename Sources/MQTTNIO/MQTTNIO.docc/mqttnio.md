@@ -78,6 +78,8 @@ MQTTClient supports both Swift concurrency and SwiftNIO `EventLoopFuture`. The a
 - ``MQTTSubscribeInfo``
 - ``MQTTSuback``
 - ``MQTTPublishInfo``
+- ``MQTTManualQoS1AcknowledgementHandler``
+- ``MQTTManualQoS1AcknowledgementLimits``
 - ``MQTTPublishListener``
 - ``MQTTQoS``
 - ``MQTTPacketType``
@@ -85,6 +87,7 @@ MQTTClient supports both Swift concurrency and SwiftNIO `EventLoopFuture`. The a
 ### Errors
 
 - ``MQTTError``
+- ``MQTTManualQoS1AcknowledgementError``
 - ``MQTTPacketError``
 
 ### V5 Connection
