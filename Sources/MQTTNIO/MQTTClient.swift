@@ -82,6 +82,7 @@ public final class MQTTClient {
     private var inflight: MQTTInflight
     /// flag to tell is client is shutdown
     private let isShutdown = ManagedAtomic(false)
+    private var _manualQoS1AcknowledgementHandler: MQTTManualQoS1AcknowledgementHandler?
 
     typealias ShutdownCallback = @Sendable (Error?) -> Void
 
@@ -119,6 +120,7 @@ public final class MQTTClient {
         self.identifier = identifier
         self.configuration = configuration
         self._connection = nil
+        self._manualQoS1AcknowledgementHandler = nil
         self.logger = (logger ?? Self.loggingDisabled).attachingClientIdentifier(self.identifier)
         self.eventLoopGroupProvider = eventLoopGroupProvider
         switch eventLoopGroupProvider {
@@ -247,6 +249,9 @@ public final class MQTTClient {
             self.publishListeners.removeAll()
             self.closeListeners.removeAll()
             self.shutdownListeners.removeAll()
+            self.lock.withLock {
+                self._manualQoS1AcknowledgementHandler = nil
+            }
 
             self.shutdownEventLoopGroup(queue: queue) { error in
                 callback(closeError ?? error)
@@ -418,6 +423,26 @@ public final class MQTTClient {
         self.publishListeners.addListener(named: name, listener: listener)
     }
 
+    /// Installs the single handler that controls PUBACK for inbound QoS 1 publishes.
+    ///
+    /// When installed, inbound QoS 1 publishes are delivered to this handler instead
+    /// of publish listeners. Return a future that succeeds only after durable
+    /// acceptance. MQTTNIO sends PUBACK after success. On failure it sends no PUBACK
+    /// and closes the connection so a persistent broker session can redeliver the
+    /// message.
+    ///
+    /// The future may belong to any event loop. The handler itself runs on the
+    /// connection's event loop, so it must start asynchronous work and return without
+    /// blocking. Calling this method again atomically replaces the previous handler;
+    /// pass `nil` to restore the original ACK-before-listener behavior. Shutdown clears
+    /// the handler. Calls made after shutdown begins have no effect.
+    public func setManualQoS1AcknowledgementHandler(_ handler: MQTTManualQoS1AcknowledgementHandler?) {
+        self.lock.withLock {
+            guard !self.isShutdown.load(ordering: .relaxed) else { return }
+            self._manualQoS1AcknowledgementHandler = handler
+        }
+    }
+
     /// Remove named publish listener
     public func removePublishListener(named name: String) {
         self.publishListeners.removeListener(named: name)
@@ -468,6 +493,12 @@ public final class MQTTClient {
     let shutdownListeners = MQTTListeners<Result<Void, Error>>()
     private var _connection: MQTTConnection?
     private var lock = NIOLock()
+
+    var manualQoS1AcknowledgementHandler: MQTTManualQoS1AcknowledgementHandler? {
+        self.lock.withLock {
+            self._manualQoS1AcknowledgementHandler
+        }
+    }
 }
 
 extension MQTTClient {

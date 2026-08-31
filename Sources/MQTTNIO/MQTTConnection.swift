@@ -34,7 +34,7 @@ final class MQTTConnection {
     let timeout: TimeAmount?
     let taskHandler: MQTTTaskHandler
 
-    private init(channel: Channel, cleanSession: Bool, timeout: TimeAmount?, taskHandler: MQTTTaskHandler) {
+    init(channel: Channel, cleanSession: Bool, timeout: TimeAmount?, taskHandler: MQTTTaskHandler) {
         self.channel = channel
         self.cleanSession = cleanSession
         self.timeout = timeout

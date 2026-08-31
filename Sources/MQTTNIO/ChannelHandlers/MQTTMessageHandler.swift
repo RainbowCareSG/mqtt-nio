@@ -80,7 +80,7 @@ class MQTTMessageHandler: ChannelDuplexHandler {
                             "mqtt_topicName": .string(publishMessage.publish.topicName),
                         ]
                     )
-                    self.respondToPublish(publishMessage)
+                    self.respondToPublish(publishMessage, context: context)
                     return
 
                 case .CONNACK, .PUBACK, .PUBREC, .PUBCOMP, .SUBACK, .UNSUBACK, .PINGRESP, .AUTH:
@@ -122,16 +122,42 @@ class MQTTMessageHandler: ChannelDuplexHandler {
     /// If QoS is `.atMostOnce` then no response is required
     /// If QoS is `.atLeastOnce` then send PUBACK
     /// If QoS is `.exactlyOnce` then send PUBREC, wait for PUBREL and then respond with PUBCOMP (in `respondToPubrel`)
-    private func respondToPublish(_ message: MQTTPublishPacket) {
+    private func respondToPublish(_ message: MQTTPublishPacket, context: ChannelHandlerContext) {
         guard let connection = client.connection else { return }
         switch message.publish.qos {
         case .atMostOnce:
             self.client.publishListeners.notify(.success(message.publish))
 
         case .atLeastOnce:
-            connection.sendMessageNoWait(MQTTPubAckPacket(type: .PUBACK, packetId: message.packetId))
-                .map { _ in message.publish }
-                .whenComplete { self.client.publishListeners.notify($0) }
+            if let handler = self.client.manualQoS1AcknowledgementHandler {
+                handler(message.packetId, message.publish)
+                    .hop(to: context.eventLoop)
+                    .whenComplete { result in
+                        switch result {
+                        case .success:
+                            connection.sendMessageNoWait(MQTTPubAckPacket(type: .PUBACK, packetId: message.packetId))
+                                .whenFailure { error in
+                                    context.fireErrorCaught(error)
+                                    context.close(promise: nil)
+                                }
+                        case .failure(let error):
+                            self.client.logger.error(
+                                "Manual QoS 1 acknowledgement failed; closing connection without PUBACK",
+                                metadata: [
+                                    "mqtt_error": .string("\(error)"),
+                                    "mqtt_packet_id": .stringConvertible(message.packetId),
+                                    "mqtt_topicName": .string(message.publish.topicName),
+                                ]
+                            )
+                            context.fireErrorCaught(error)
+                            context.close(promise: nil)
+                        }
+                    }
+            } else {
+                connection.sendMessageNoWait(MQTTPubAckPacket(type: .PUBACK, packetId: message.packetId))
+                    .map { _ in message.publish }
+                    .whenComplete { self.client.publishListeners.notify($0) }
+            }
 
         case .exactlyOnce:
             var publish = message.publish

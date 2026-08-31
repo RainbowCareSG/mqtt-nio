@@ -81,6 +81,21 @@ public struct MQTTPublishInfo: Sendable {
     static let emptyByteBuffer = ByteBufferAllocator().buffer(capacity: 0)
 }
 
+/// Handles an inbound QoS 1 publish whose PUBACK is controlled by the application.
+///
+/// Return a future that succeeds only after `publish` has been durably accepted. The
+/// future may belong to any event loop. MQTTNIO sends PUBACK after it succeeds; if it
+/// fails, MQTTNIO closes the connection without acknowledging the publish so the
+/// broker can redeliver it when the client uses a persistent session.
+///
+/// The handler is called on the connection's event loop and must return promptly. Do
+/// not block while doing durable work; represent that work with the returned future.
+public typealias MQTTManualQoS1AcknowledgementHandler =
+    @Sendable (
+        _ packetIdentifier: UInt16,
+        _ publish: MQTTPublishInfo
+    ) -> EventLoopFuture<Void>
+
 /// MQTT SUBSCRIBE packet parameters.
 public struct MQTTSubscribeInfo: Sendable {
     /// Topic filter to subscribe to.
